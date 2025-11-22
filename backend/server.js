@@ -1,6 +1,10 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+require('dotenv').config();
+
+// Import database models
+const Link = require('./models/link');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -10,71 +14,96 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Health check endpoint
-app.get('/healthz', (req, res) => {
-  res.json({
-    ok: true,
-    version: '1.0',
-    timestamp: new Date().toISOString(),
-    database: 'not connected'
-  });
-});
+// Initialize database
+const initializeDatabase = require('./config/init');
 
-// Simple in-memory storage (temporary)
-let links = [];
+// Health check endpoint
+app.get('/healthz', async (req, res) => {
+  try {
+    // Test database connection
+    await require('./config/database').query('SELECT 1');
+    
+    res.json({
+      ok: true,
+      version: '1.0',
+      timestamp: new Date().toISOString(),
+      database: 'connected'
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      version: '1.0',
+      timestamp: new Date().toISOString(),
+      database: 'disconnected',
+      error: error.message
+    });
+  }
+});
 
 // API Routes
-app.get('/api/links', (req, res) => {
-  res.json(links);
+app.get('/api/links', async (req, res) => {
+  try {
+    const links = await Link.findAll();
+    res.json(links);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch links' });
+  }
 });
 
-app.post('/api/links', (req, res) => {
-  const { target_url, custom_code } = req.body;
-  
-  if (!target_url) {
-    return res.status(400).json({ error: 'URL is required' });
+app.post('/api/links', async (req, res) => {
+  try {
+    const { target_url, custom_code } = req.body;
+
+    // Validate URL
+    if (!target_url) {
+      return res.status(400).json({ error: 'URL is required' });
+    }
+
+    try {
+      new URL(target_url);
+    } catch (err) {
+      return res.status(400).json({ error: 'Invalid URL' });
+    }
+
+    // Create link
+    const link = await Link.create({ target_url, custom_code });
+    res.status(201).json(link);
+  } catch (error) {
+    if (error.message === 'Custom code already exists') {
+      return res.status(409).json({ error: 'Custom code already exists' });
+    }
+    res.status(500).json({ error: 'Failed to create link' });
   }
-  
-  const code = custom_code || Math.random().toString(36).substring(2, 8);
-  
-  // Check if code already exists
-  if (links.find(link => link.code === code)) {
-    return res.status(409).json({ error: 'Custom code already exists' });
-  }
-  
-  const newLink = {
-    code,
-    target_url,
-    clicks: 0,
-    last_clicked: null,
-    created_at: new Date().toISOString()
-  };
-  
-  links.push(newLink);
-  res.status(201).json(newLink);
 });
 
-app.get('/api/links/:code', (req, res) => {
-  const { code } = req.params;
-  const link = links.find(l => l.code === code);
-  
-  if (!link) {
-    return res.status(404).json({ error: 'Link not found' });
+app.get('/api/links/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    const stats = await Link.getStats(code);
+    
+    if (!stats) {
+      return res.status(404).json({ error: 'Link not found' });
+    }
+    
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch link stats' });
   }
-  
-  res.json(link);
 });
 
-app.delete('/api/links/:code', (req, res) => {
-  const { code } = req.params;
-  const index = links.findIndex(l => l.code === code);
-  
-  if (index === -1) {
-    return res.status(404).json({ error: 'Link not found' });
+app.delete('/api/links/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    const deletedLink = await Link.delete(code);
+    
+    if (!deletedLink) {
+      return res.status(404).json({ error: 'Link not found' });
+    }
+    
+    res.json({ message: 'Link deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete link' });
   }
-  
-  links.splice(index, 1);
-  res.json({ message: 'Link deleted successfully' });
 });
 
 // Frontend routes
@@ -86,38 +115,27 @@ app.get('/code/:code', (req, res) => {
   res.sendFile(path.join(__dirname, '../public/index.html'));
 });
 
-// Redirect route (simple version)
-app.get('/:code', (req, res) => {
+// Redirect route
+app.get('/:code', async (req, res) => {
   const { code } = req.params;
-  const link = links.find(l => l.code === code);
   
-  if (!link) {
-    return res.status(404).json({ error: 'Link not found' });
+  try {
+    const link = await Link.findByCode(code);
+    if (!link) {
+      return res.status(404).json({ error: 'Link not found' });
+    }
+    
+    await Link.incrementClicks(code);
+    res.redirect(302, link.target_url);
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
   }
-  
-  // Increment clicks
-  link.clicks++;
-  link.last_clicked = new Date().toISOString();
-  
-  res.redirect(302, link.target_url);
 });
 
-// Smart port finding function
-function startServer(port) {
-  const server = app.listen(port, () => {
-    console.log(`🚀 TinyLink server running on http://localhost:${port}`);
-    console.log(`📊 Using temporary in-memory storage`);
+// Initialize database and start server
+initializeDatabase().then(() => {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 TinyLink server running on port ${PORT}`);
+    console.log(`🗄️ Connected to PostgreSQL database`);
   });
-
-  server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-      console.log(`Port ${port} is busy, trying ${port + 1}...`);
-      startServer(port + 1);
-    } else {
-      console.error('Server error:', err);
-    }
-  });
-}
-
-// Start the server with automatic port finding
-startServer(PORT);
+});
